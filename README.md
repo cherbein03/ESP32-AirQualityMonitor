@@ -17,12 +17,21 @@ Power XIAO by USB. Join all grounds. Feed PMS5003 VCC and display VCC from USB 5
 
 ## Build and upload from VS Code
 
-1. Install the PlatformIO IDE extension.
-2. Open this project folder in VS Code and allow PlatformIO to install the toolchain and libraries.
-3. Connect the XIAO by USB. Select its serial port in PlatformIO if it is not detected automatically.
-4. Use **PlatformIO: Build**, then **PlatformIO: Upload**. The monitor runs at 115200 baud.
+This repository is now an ESP-IDF CMake project. The firmware still uses the
+Arduino-ESP32 APIs as an ESP-IDF component, which preserves the Zigbee and
+Arduino sensor/display code while using the ESP-IDF toolchain and project
+configuration.
 
-The project uses the pioarduino platform because the maintained upstream PlatformIO Espressif platform does not carry the Arduino Zigbee APIs needed here. Build profile is Zigbee End Device with the `zigbee.csv` partition table.
+1. Install ESP-IDF and the ESP-IDF VS Code extension.
+2. Open this project folder and select the `esp32c6` target.
+3. Run **ESP-IDF: Build your project**.
+4. Connect the XIAO by USB and run **ESP-IDF: Flash your project** or
+   **ESP-IDF: Build, Flash and Monitor**. The monitor runs at 115200 baud.
+
+The first build downloads the Arduino-ESP32 component and the local Arduino
+library sources under `components/air-quality-libs`. `sdkconfig.defaults`
+sets the ESP32-C6 target and the 1000 Hz FreeRTOS tick rate required by the
+Arduino component.
 
 ## Pairing and operation
 

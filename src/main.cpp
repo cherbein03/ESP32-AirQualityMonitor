@@ -1,257 +1,305 @@
-#include <Arduino.h>
-#include <Wire.h>
-#include <SPI.h>
-#include <Adafruit_AHTX0.h>
-#include <SparkFun_ENS160.h>
-#include <Arduino_GFX_Library.h>
-#include <Zigbee.h>
+#include <math.h>
+#include <stdio.h>
 
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+#include "driver/uart.h"
+
+#include "esp_log.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "nvs_flash.h"
+
+#include "ha/esp_zigbee_ha_standard.h"
+#include "esp_zigbee_attribute.h"
+#include "zcl/esp_zigbee_zcl_temperature_meas.h"
+
+#include "native_display.h"
+#include "native_sensors.h"
 #include "project_config.h"
 
-#ifndef ZIGBEE_MODE_ED
-#error "Build this device as a Zigbee End Device (ZIGBEE_MODE_ED)."
-#endif
+static const char *TAG = "air_quality";
 
-// The ILI9488 is an 18-bit SPI display. This module has 3.3 V logic even when
-// its VCC pin is powered from USB VBUS/5 V.
-Arduino_DataBus *displayBus = new Arduino_ESP32SPI(
-    PIN_TFT_DC, PIN_TFT_CS, PIN_TFT_SCK, PIN_TFT_MOSI, PIN_TFT_MISO);
-Arduino_GFX *display = new Arduino_ILI9488_18bit(
-    displayBus, PIN_TFT_RESET, 1 /* landscape */, false /* IPS */);
+static air_quality_readings_t readings;
+static float pm25 = NAN;
+static float pm;
+static esp_zb_ep_list_t *temperature_ep = nullptr;
 
-Adafruit_AHTX0 aht;
-SparkFun_ENS160 ens160;
-HardwareSerial pmSerial(1);
 
-ZigbeeTempSensor envEndpoint(EP_ENVIRONMENT);
-ZigbeePM25Sensor pmEndpoint(EP_PM25);
-ZigbeeCarbonDioxideSensor co2Endpoint(EP_ECO2);
-ZigbeeAnalog tvocEndpoint(EP_TVOC);
-ZigbeeAnalog aqiEndpoint(EP_AQI);
+/* -------------------------------------------------------------------------- */
+/* PMS5003                                                                     */
+/* -------------------------------------------------------------------------- */
 
-struct Measurements {
-  float temperatureC = NAN;
-  float humidity = NAN;
-  float pm25 = NAN;
-  float eco2 = NAN;
-  float tvoc = NAN;
-  float aqi = NAN;
-  bool ahtOk = false;
-  bool ensOk = false;
-  bool pmOk = false;
-};
+static bool read_pms5003(float *value)
+{
+    static uint8_t frame[32];
+    static size_t used = 0;
 
-Measurements values;
-bool useFahrenheit = DEFAULT_USE_FAHRENHEIT;
-uint32_t lastSampleMs = 0;
-uint32_t lastDisplayMs = 0;
-uint32_t buttonPressedAt = 0;
-bool buttonHandled = false;
+    uint8_t byte;
 
-static void printValue(int16_t x, int16_t y, const char *label, float value,
-                       const char *unit, uint8_t decimals = 1) {
-  display->setCursor(x, y);
-  display->setTextColor(WHITE, BLACK);
-  display->setTextSize(2);
-  display->print(label);
-  if (isnan(value)) {
-    display->print("--");
-  } else {
-    display->print(value, decimals);
-  }
-  display->print(unit);
-}
+    while (uart_read_bytes(UART_NUM_1, &byte, 1, 0) == 1)
+    {
+        if (used == 0 && byte != 0x42)
+        {
+            continue;
+        }
 
-static void drawScreen() {
-  display->fillScreen(BLACK);
-  display->setTextColor(CYAN, BLACK);
-  display->setTextSize(3);
-  display->setCursor(12, 10);
-  display->print("AIR QUALITY");
+        if (used == 1 && byte != 0x4D)
+        {
+            used = 0;
+            continue;
+        }
 
-  char status[28];
-  snprintf(status, sizeof(status), "Zigbee: %s", Zigbee.connected() ? "connected" : "pairing...");
-  display->setTextColor(Zigbee.connected() ? GREEN : YELLOW, BLACK);
-  display->setTextSize(1);
-  display->setCursor(350, 21);
-  display->print(status);
+        frame[used++] = byte;
 
-  const float temp = values.temperatureC;
-  printValue(12, 65, "Temp: ", useFahrenheit && !isnan(temp) ? temp * 9.0f / 5.0f + 32.0f : temp,
-             useFahrenheit ? " F" : " C", 1);
-  printValue(12, 100, "Humidity: ", values.humidity, " %", 1);
-  printValue(12, 145, "PM2.5: ", values.pm25, " ug/m3", 1);
-  printValue(12, 190, "eCO2: ", values.eco2, " ppm", 0);
-  printValue(12, 235, "TVOC: ", values.tvoc, " ppb", 0);
-  printValue(12, 280, "AQI (UBA 1-5): ", values.aqi, "", 0);
+        if (used == sizeof(frame))
+        {
+            used = 0;
 
-  display->setTextSize(1);
-  display->setTextColor(0xC618, BLACK);
-  display->setCursor(350, 300);
-  display->print("Report interval: set in Hubitat | Hold D6 3s to re-pair");
-}
+            uint16_t sum = 0;
 
-// PMS5003 active-mode frames are 32 bytes, start 0x42 0x4D, and carry a
-// 16-bit additive checksum. Concentration bytes 12..13 are PM2.5 atmospheric.
-static bool readPms5003(float &pm25) {
-  static uint8_t frame[32];
-  static size_t used = 0;
-  while (pmSerial.available()) {
-    const uint8_t byteIn = static_cast<uint8_t>(pmSerial.read());
-    if (used == 0 && byteIn != 0x42) continue;
-    if (used == 1 && byteIn != 0x4D) {
-      used = byteIn == 0x42 ? 1 : 0;
-      frame[0] = 0x42;
-      continue;
+            for (size_t i = 0; i < 30; ++i)
+            {
+                sum += frame[i];
+            }
+
+            uint16_t supplied =
+                ((uint16_t)frame[30] << 8) | frame[31];
+
+            if ((((uint16_t)frame[2] << 8) | frame[3]) != 28 ||
+                sum != supplied)
+            {
+                return false;
+            }
+
+            *value =
+                (float)(((uint16_t)frame[12] << 8) | frame[13]);
+
+            return true;
+        }
     }
-    frame[used++] = byteIn;
-    if (used == sizeof(frame)) {
-      used = 0;
-      const uint16_t length = (uint16_t(frame[2]) << 8) | frame[3];
-      uint16_t sum = 0;
-      for (size_t i = 0; i < 30; ++i) sum += frame[i];
-      const uint16_t supplied = (uint16_t(frame[30]) << 8) | frame[31];
-      if (length != 28 || sum != supplied) return false;
-      pm25 = (uint16_t(frame[12]) << 8) | frame[13];
-      return true;
+
+    return false;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Zigbee                                                                       */
+/* -------------------------------------------------------------------------- */
+
+static void update_zigbee(void)
+{
+    if (!temperature_ep || !readings.aht_ok)
+    {
+        return;
     }
-  }
-  return false;
+
+    int16_t temperature =
+        (int16_t)lroundf(readings.temperature_c * 100.0f);
+
+    esp_zb_zcl_set_attribute_val(
+        EP_ENVIRONMENT,
+        ESP_ZB_ZCL_CLUSTER_ID_TEMP_MEASUREMENT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_TEMP_MEASUREMENT_VALUE_ID,
+        &temperature,
+        false);
 }
 
-static void sampleSensors() {
-  sensors_event_t humidityEvent, temperatureEvent;
-  values.ahtOk = aht.getEvent(&humidityEvent, &temperatureEvent);
-  if (values.ahtOk) {
-    values.temperatureC = temperatureEvent.temperature;
-    values.humidity = humidityEvent.relative_humidity;
-    // Feed actual ambient compensation back to the ENS160.
-    ens160.setTempCompensationCelsius(values.temperatureC);
-    ens160.setRHCompensationFloat(values.humidity);
-  }
+static void zigbee_task(void *)
+{
+    esp_zb_cfg_t network_cfg = {};
 
-  values.ensOk = ens160.checkDataStatus();
-  if (values.ensOk) {
-    values.aqi = ens160.getAQI();
-    values.tvoc = ens160.getTVOC();
-    values.eco2 = ens160.getECO2();
-  }
+    network_cfg.esp_zb_role = ESP_ZB_DEVICE_TYPE_ED;
+    network_cfg.install_code_policy = false;
+    network_cfg.nwk_cfg.zed_cfg.ed_timeout =
+        ESP_ZB_ED_AGING_TIMEOUT_64MIN;
+    network_cfg.nwk_cfg.zed_cfg.keep_alive = 3000;
 
-  float pm = NAN;
-  if (readPms5003(pm)) {
-    values.pm25 = pm;
-    values.pmOk = true;
-  }
+    esp_zb_init(&network_cfg);
 
-  if (values.ahtOk) {
-    envEndpoint.setTemperature(values.temperatureC);
-    envEndpoint.setHumidity(values.humidity);
-  }
-  if (values.pmOk) pmEndpoint.setPM25(values.pm25);
-  if (values.ensOk) {
-    co2Endpoint.setCarbonDioxide(values.eco2);
-    tvocEndpoint.setAnalogInput(values.tvoc);
-    aqiEndpoint.setAnalogInput(values.aqi);
-  }
+    esp_zb_temperature_sensor_cfg_t sensor_cfg =
+        ESP_ZB_DEFAULT_TEMPERATURE_SENSOR_CONFIG();
+
+    temperature_ep =
+        esp_zb_temperature_sensor_ep_create(
+            EP_ENVIRONMENT,
+            &sensor_cfg);
+
+    esp_zb_device_register(temperature_ep);
+
+    esp_zb_set_primary_network_channel_set(0x07FFF800);
+
+    ESP_ERROR_CHECK(esp_zb_start(false));
+
+    while (true)
+    {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 }
 
-static void initZigbee() {
-  envEndpoint.setManufacturerAndModel("DIY", "ESP32C6-AirQualityMonitor");
-  envEndpoint.setMinMaxValue(-20, 80);
-  envEndpoint.addHumiditySensor(0, 100, 1);
+extern "C" void esp_zb_app_signal_handler(
+    esp_zb_app_signal_t *signal)
+{
+    if (!signal)
+    {
+        return;
+    }
 
-  pmEndpoint.setManufacturerAndModel("DIY", "ESP32C6-AirQualityMonitor");
-  pmEndpoint.setMinMaxValue(0, 1000);
+    const esp_zb_app_signal_type_t type =
+        static_cast<esp_zb_app_signal_type_t>(
+            *(signal->p_app_signal));
 
-  co2Endpoint.setManufacturerAndModel("DIY", "ESP32C6-AirQualityMonitor");
-  co2Endpoint.setMinMaxValue(0, 65000);
-
-  tvocEndpoint.addAnalogInput();
-  tvocEndpoint.setManufacturerAndModel("DIY", "ESP32C6-AirQualityMonitor-TVOC");
-  tvocEndpoint.setAnalogInputDescription("ENS160 TVOC (ppb)");
-  tvocEndpoint.setAnalogInputMinMax(0, 65000);
-  tvocEndpoint.setAnalogInputResolution(1);
-
-  aqiEndpoint.addAnalogInput();
-  aqiEndpoint.setManufacturerAndModel("DIY", "ESP32C6-AirQualityMonitor-AQI");
-  aqiEndpoint.setAnalogInputDescription("ENS160 AQI-UBA (1-5)");
-  aqiEndpoint.setAnalogInputMinMax(1, 5);
-  aqiEndpoint.setAnalogInputResolution(1);
-
-  Zigbee.addEndpoint(&envEndpoint);
-  Zigbee.addEndpoint(&pmEndpoint);
-  Zigbee.addEndpoint(&co2Endpoint);
-  Zigbee.addEndpoint(&tvocEndpoint);
-  Zigbee.addEndpoint(&aqiEndpoint);
-
-  if (!Zigbee.begin()) {
-    Serial.println("Zigbee start failed; rebooting.");
-    delay(1000);
-    ESP.restart();
-  }
+    if ((type == ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP ||
+         type == ESP_ZB_BDB_SIGNAL_DEVICE_FIRST_START) &&
+        signal->esp_err_status == ESP_OK)
+    {
+        esp_zb_bdb_start_top_level_commissioning(
+            type == ESP_ZB_ZDO_SIGNAL_SKIP_STARTUP
+                ? ESP_ZB_BDB_MODE_INITIALIZATION
+                : ESP_ZB_BDB_MODE_NETWORK_STEERING);
+    }
 }
 
-static void handleButton() {
-  const bool pressed = digitalRead(PIN_BUTTON) == LOW;
-  if (pressed && buttonPressedAt == 0) {
-    buttonPressedAt = millis();
-    buttonHandled = false;
-  } else if (pressed && !buttonHandled && millis() - buttonPressedAt >= BUTTON_HOLD_RESET_MS) {
-    buttonHandled = true;
-    display->fillScreen(BLACK);
-    display->setCursor(16, 30);
-    display->setTextSize(2);
-    display->setTextColor(YELLOW, BLACK);
-    display->print("Clearing Zigbee and re-pairing...");
-    Serial.println("Long press: clearing Zigbee network settings.");
-    Zigbee.factoryReset(true);
-  } else if (!pressed) {
-    buttonPressedAt = 0;
-    buttonHandled = false;
-  }
+/* -------------------------------------------------------------------------- */
+/* Sensor Task                                                                  */
+/* -------------------------------------------------------------------------- */
+
+static void sensor_task(void *pvParameters)
+{
+    while (true)
+    {
+        air_quality_sensors_read(&readings);
+
+        native_display_show_readings(
+            readings.temperature_c,
+            readings.humidity_percent,
+            readings.eco2_ppm,
+            readings.tvoc_ppb,
+            readings.aqi);
+
+        if (readings.aht_ok)
+        {
+            ESP_LOGI(
+                TAG,
+                "Temp=%.1fC Hum=%.1f%%",
+                readings.temperature_c,
+                readings.humidity_percent);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "AHT20 read failed");
+        }
+
+        if (readings.ens_ok)
+        {
+            ESP_LOGI(
+                TAG,
+                "eCO2=%.0fppm TVOC=%.0fppb AQI=%.0f",
+                readings.eco2_ppm,
+                readings.tvoc_ppb,
+                readings.aqi);
+        }
+        else
+        {
+            ESP_LOGW(TAG, "ENS160 read failed");
+        }
+
+        if (read_pms5003(&pm))
+            {
+                pm25 = pm;
+            }
+
+        update_zigbee();
+
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
 }
 
-void setup() {
-  Serial.begin(115200);
-  pinMode(PIN_BUTTON, INPUT_PULLUP);
 
-  Wire.begin(PIN_I2C_SDA, PIN_I2C_SCL);
-  SPI.begin(PIN_TFT_SCK, PIN_TFT_MISO, PIN_TFT_MOSI);
-  display->begin();
-  display->fillScreen(BLACK);
-  display->setTextColor(WHITE, BLACK);
-  display->setTextSize(2);
-  display->setCursor(12, 12);
-  display->println("ESP32-C6 Air Quality");
-  display->println("Starting sensors...");
 
-  pmSerial.begin(9600, SERIAL_8N1, PIN_PM_RX, PIN_PM_TX);
-  values.ahtOk = aht.begin(&Wire);
-  values.ensOk = ens160.begin();
-  if (values.ensOk) {
-    ens160.setOperatingMode(SFE_ENS160_STANDARD);
-  }
-  Serial.printf("AHT2X: %s | ENS160: %s\n", values.ahtOk ? "OK" : "not found",
-                values.ensOk ? "OK" : "not found");
+/* -------------------------------------------------------------------------- */
+/* Main                                                                       */
+/* -------------------------------------------------------------------------- */
 
-  initZigbee();
-  lastSampleMs = millis() - SENSOR_SAMPLE_MS;
-  lastDisplayMs = millis() - DISPLAY_REFRESH_MS;
+extern "C" void app_main(void)
+{
+    esp_err_t err = nvs_flash_init();
+
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES ||
+        err == ESP_ERR_NVS_NEW_VERSION_FOUND)
+    {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ESP_ERROR_CHECK(nvs_flash_init());
+    }
+    else
+    {
+        ESP_ERROR_CHECK(err);
+    }
+
+    gpio_config_t button = {
+        .pin_bit_mask = 1ULL << PIN_BUTTON,
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE};
+
+    ESP_ERROR_CHECK(gpio_config(&button));
+
+    uart_config_t uart = {};
+
+    uart.baud_rate = 9600;
+    uart.data_bits = UART_DATA_8_BITS;
+    uart.parity = UART_PARITY_DISABLE;
+    uart.stop_bits = UART_STOP_BITS_1;
+    uart.flow_ctrl = UART_HW_FLOWCTRL_DISABLE;
+    uart.source_clk = UART_SCLK_DEFAULT;
+
+    ESP_ERROR_CHECK(
+        uart_driver_install(
+            UART_NUM_1,
+            1024,
+            0,
+            0,
+            nullptr,
+            0));
+
+    ESP_ERROR_CHECK(
+        uart_param_config(
+            UART_NUM_1,
+            &uart));
+
+    ESP_ERROR_CHECK(
+        uart_set_pin(
+            UART_NUM_1,
+            PIN_PM_TX,
+            PIN_PM_RX,
+            UART_PIN_NO_CHANGE,
+            UART_PIN_NO_CHANGE));
+
+    ESP_ERROR_CHECK(air_quality_sensors_init());
+    ESP_ERROR_CHECK(native_display_init());
+    
+ 
+
+    xTaskCreate(
+        sensor_task,
+        "sensor_task",
+        4096,
+        nullptr,
+        5,
+        nullptr);
+
+    xTaskCreate(
+        zigbee_task,
+        "zigbee_task",
+        8192,
+        nullptr,
+        20,
+        nullptr);
+
+    ESP_LOGI(
+        TAG,
+        "ESP32-C6 air-quality monitor started");
 }
-
-void loop() {
-  handleButton();
-  const uint32_t now = millis();
-  if (now - lastSampleMs >= SENSOR_SAMPLE_MS) {
-    lastSampleMs = now;
-    sampleSensors();
-  }
-  if (now - lastDisplayMs >= DISPLAY_REFRESH_MS) {
-    lastDisplayMs = now;
-    drawScreen();
-  }
-  // Attribute reports are sent on the interval configured by Hubitat's
-  // Configure Reporting requests. Do not send on a second, firmware-fixed timer.
-  delay(10);
-}
-

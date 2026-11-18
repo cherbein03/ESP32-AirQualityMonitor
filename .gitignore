@@ -1,0 +1,9 @@
+# ESP-IDF generated output
+build/
+managed_components/
+dependencies.lock
+sdkconfig
+sdkconfig.old
+
+# PlatformIO legacy output, if the old profile is used
+.pio/

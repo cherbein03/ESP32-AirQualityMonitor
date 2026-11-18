@@ -1,0 +1,21 @@
+#include <math.h>
+#include <stdio.h>
+#include "driver/gpio.h"
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "nvs_flash.h"
+#include "ha/esp_zigbee_ha_standard.h"
+#include "esp_zigbee_attribute.h"
+#include "zcl/esp_zigbee_zcl_temperature_meas.h"
+#include "native_sensors.h"
+#include "native_display.h"
+#include "project_config.h"
+
+static const char *TAG = "air_quality";
+static air_quality_readings_t readings;
+static float pm25 = NAN;
+static esp_zb_ep_list_t *temperature_ep;
+
+// ... rest of original code
