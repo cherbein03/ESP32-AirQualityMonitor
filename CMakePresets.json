@@ -12,7 +12,28 @@
       "description": "Development configuration",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "SDKCONFIG": "${sourceDir}/sdkconfig"
+        "SDKCONFIG": "${sourceDir}/sdkconfig",
+        "IDF_TARGET": "esp32c6"
+      },
+      "environment": {
+        "OPENOCD_USB_ADAPTER_LOCATION": "1-1"
+      },
+      "vendor": {
+        "espressif/vscode-esp-idf": {
+          "schemaVersion": 1,
+          "settings": [
+            {
+              "type": "openOCD",
+              "value": {
+                "debugLevel": 2,
+                "configs": [
+                  "board/esp32c6-builtin.cfg"
+                ],
+                "args": []
+              }
+            }
+          ]
+        }
       }
     },
     {

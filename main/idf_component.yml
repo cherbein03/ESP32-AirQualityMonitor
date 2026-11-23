@@ -1,5 +1,10 @@
 dependencies:
   espressif/esp-zboss-lib:
     version: "==1.6.4"
+
   espressif/esp-zigbee-lib:
     version: "==1.6.8"
+
+  lvgl/lvgl: "^8"
+  
+  atanisoft/esp_lcd_ili9488: "^1.0.10"

@@ -18,6 +18,16 @@
 #define PIN_TFT_RESET 17
 #define PIN_TOUCH_CS 4
 
+#define SPI_CLOCK PIN_TFT_SCK
+#define SPI_MOSI  PIN_TFT_MOSI
+#define SPI_MISO  PIN_TFT_MISO
+#define TFT_CS    PIN_TFT_CS
+#define TFT_DC    PIN_TFT_DC
+#define TFT_RESET PIN_TFT_RESET
+
+#define DISPLAY_HORIZONTAL_PIXELS 320
+#define DISPLAY_VERTICAL_PIXELS   480
+
 // These are presentation defaults. Hubitat preferences can change display units
 // and the Zigbee reporting interval; see hubitat/AirQualityMonitor.groovy.
 #define DEFAULT_USE_FAHRENHEIT false

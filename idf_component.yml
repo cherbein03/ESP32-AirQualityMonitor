@@ -7,6 +7,3 @@ dependencies:
 #   version: "==1.0.0"
 
 # Using ESP32-C6 hardware platform with native Zigbee radio support
-
-
-  lvgl/lvgl: "^9"

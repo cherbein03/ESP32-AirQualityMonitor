@@ -1,6 +1,7 @@
 #pragma once
 
 #include <stdbool.h>
+#include <stdint.h>
 #include "esp_err.h"
 
 #ifdef __cplusplus
@@ -13,6 +14,7 @@ typedef struct {
     float eco2_ppm;
     float tvoc_ppb;
     float aqi;
+    uint8_t ens_status;
     bool aht_ok;
     bool ens_ok;
 } air_quality_readings_t;
